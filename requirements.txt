@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+selenium
+lxml
+pyinstaller
+openpyxl
