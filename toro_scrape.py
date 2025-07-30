@@ -1,7 +1,15 @@
 # toro_scrape.py
-# Version: 0.1.0
-# Last Updated: 2025-07-28
+# Version: 0.2.0
+# Last Updated: 2025-07-29
 
+import platform
+import sys
+from pathlib import Path
+import requests
+from bs4 import BeautifulSoup
+import ftplib
+import openpyxl
+import re
 import time
 import csv
 import os
@@ -11,17 +19,23 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.service import Service
+
+base_path = ""
+chromedriver_filename = ""
 
 def load_config(path='config.txt'):
     with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
-def read_product_numbers(csv_path):
+def read_product_numbers(csv_path, max_rows=None):
     product_numbers = []
     with open(csv_path, newline='', encoding='utf-8') as csvfile:
         reader = csv.DictReader(csvfile)
-        for row in reader:
+        for i, row in enumerate(reader):
+            if max_rows and i >= max_rows:
+                break
             product_numbers.append(row['Product #'])
     return product_numbers
 
@@ -103,23 +117,45 @@ def scrape_product_details(driver):
     return details
 
 def main():
+    if getattr(sys, 'frozen', False):
+        base_path = Path(sys.argv[0]).resolve().parent
+    else:
+        base_path = Path(__file__).resolve().parent
+    
     config = load_config()
     output_file = config.get('output_file', 'output.csv')
     product_url_root = "https://shop.thetorocompany.com/Product_UrlRoot"
-    product_csv = 'allproductssamplefile.csv'
-
+    product_csv = config.get('input_file', 'allproductssamplefile.csv')
+    
     # Set up Selenium WebDriver (headless optional)
     chrome_options = Options()
+    headless_mode = config.get("headless_mode", False)
+    if headless_mode:
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--disable-gpu")
+        
+    if platform.system() == "Windows":
+        chromedriver_filename = "chromedriver.exe"
+    else:
+        chromedriver_filename = "chromedriver"
+    
+    chromedriver_path = base_path / chromedriver_filename
+    if not chromedriver_path.exists():
+        sys.exit(f"Error: {chromedriver_filename} is missing at {chromedriver_path}.")
+        
+    driver_service = Service(str(chromedriver_path))
+        
     # Uncomment the next line to run headless (no browser window)
     # chrome_options.add_argument("--headless")
-    driver = webdriver.Chrome(options=chrome_options)
+    driver = webdriver.Chrome(service=driver_service,options=chrome_options)
 
     try:
         # Log in
         login(driver, config)
 
         # Read product numbers
-        product_numbers = read_product_numbers(product_csv)
+        max_rows = int(config.get('max_rows', 0)) or None
+        product_numbers = read_product_numbers(product_csv, max_rows)
         results = []
 
         for product_num in product_numbers:
