@@ -53,6 +53,55 @@ def login(driver, config):
     signon_button.click()
     time.sleep(3)  # Wait for login to process
 
+def scrape_product_details(driver):
+    details = {
+        "Product #": "",
+        "Product Name": "",
+        "Quantity": "",
+        "Cost": "",
+        "Retail": "",
+        "Description": ""
+    }
+    try:
+        # Product #
+        try:
+            details["Product #"] = driver.find_element(By.CSS_SELECTION, "span.item-num-sku.product-item").text.strip()
+        except:
+            pass
+        # Product Name
+        try:
+            details["Product Name"] = driver.find_element(By.ID, "tst_productDetail_shortDescription").text.strip()
+        except:
+            pass
+        # Quantity
+        try: 
+            if driver.find_elements(By.CSS_SELECTOR, "span.instock"):
+                details["Quantity"] = "10"
+            elif driver.find_elements(By.CSS_SELECTOR, "span.outstock"):
+                details["Quantity"] = "0"
+            else:
+                details["Quantity"] = ""
+        except:
+            details["Quantity"] = ""
+        # Cost
+        try:
+            details["Cost"] = driver.find_element(By.CSS_SELECTOR, "span.unit-net-price").text.strip()
+        except:
+            pass
+        # Retail
+        try:
+            details["Retail"] = driver.find_element(By.CSS_SELECTOR, "span[ng-bind*='unitListPrice']").text.strip()
+        except:
+            pass
+        # Description
+        try:
+            details["Description"] = driver.find_element(By.CSS_SELECTOR, "div.item.overview-content").text.strip()
+        except:
+            pass
+    except Exception as e:
+        print(f"Error scraping product details: {e}")
+    return details
+
 def main():
     config = load_config()
     output_file = config.get('output_file', 'output.csv')
@@ -78,14 +127,23 @@ def main():
             driver.get(url)
 
             if is_product_page(driver):
-                status = 'success'
+                details = scrape_product_details(driver)
+                if not details["Product #"]:
+                    details["Product #"] = product_num
+                results.append(details)
             else:
-                status = 'fail'
-            results.append({'Product #': product_num, 'status': status, 'url': url})
+                results.append({
+                    "Product #": product_num, 
+                    "Product Name": "",
+                    "Quantity": "",
+                    "Cost": "",
+                    "Retail": "",
+                    "Description": ""
+                })
 
         # Write results to output file
+        fieldnames = ["Product #", "Product Name", "Quantity", "Cost", "Retail", "Description"]
         with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['Product #', 'status', 'url']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
             for row in results:
