@@ -1,6 +1,6 @@
 # toro_scrape.py
-# Version: 0.1.0
-# Last Updated: 2025-08-05
+# Version: 0.2.0
+# Last Updated: 2025-10-13
 
 import requests
 import json
@@ -8,16 +8,26 @@ import pandas as pd
 import asyncio
 from playwright.async_api import async_playwright
 from datetime import datetime
+from ftplib import FTP, error_perm
 import time
+import sys
 import os
 import logging
+import argparse
+
+BASE_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(BASE_DIR, "browsers")
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class ToroScraperPlaywright:
-    def __init__(self, config_file="config.txt"):
+    def __init__(self, config_file=None):
+        if not config_file:
+            config_file = os.path.join(BASE_DIR, "config.txt")
+        elif not os.path.isabs(config_file):
+            config_file = os.path.join(BASE_DIR, config_file)
         self.config = self.load_config(config_file)
         self.bearer_token = None
         self.session = requests.Session()
@@ -304,9 +314,61 @@ class ToroScraperPlaywright:
             df.to_csv(output_file, index=False)
             logger.info(f"Results saved to {output_file}")
             logger.info(f"Total products scraped: {len(self.results)}")
+            return output_file
 
         except Exception as e:
             logger.error(f"Error saving results: {e}")
+            return None
+    
+    def upload_via_ftp(self, local_path):
+        """Upload the given file to an FTP server using config values."""
+        host = (self.config.get("ftp_host") or "").strip()
+        user = (self.config.get("ftp_username") or "").strip()
+        pwd = (self.config.get("ftp_password") or "").strip()
+        port = (self.config.get("ftp_port", 21))
+        remote_dir = (self.config.get("ftp_directory") or "").strip()
+        
+        if not host or not user or not pwd:
+            logger.info("FTP settings not provided; skipping FTP upload.")
+            return False
+        
+        if not os.path.isfile(local_path):
+            logger.error(f"FTP upload skipped: file does not exist: {local_path}")
+            return False
+        
+        try:
+            logger.info(f"Connecting to FTP {host}:{port} ...")
+            with FTP() as ftp:
+                ftp.connect(host, port, timeout=30)
+                ftp.login(user, pwd)
+                logger.info("FTP login successful.")
+                
+                if remote_dir:
+                    try:
+                        ftp.cwd(remote_dir)
+                    except error_perm:
+                        logger.info(f"FTP directory '{remote_dir}' not found; attempting to create it.")
+                        
+                        for part in remote_dir.replace("\\", "/").split("/"):
+                            if not part:
+                                continue
+                            try:
+                                ftp.mkd(part)
+                            except error_perm:
+                                pass
+                            ftp.cwd(part)
+                
+                filename = os.path.basename(local_path)
+                with open(local_path, "rb") as f:
+                    logger.info(f"Uploading {filename} ...")
+                    ftp.storbinary(f"STOR {filename}", f)
+                
+                logger.info("FTP upload completed successfully.")
+                return True
+        
+        except Exception as e:
+            logger.error(f"FTP upload failed: {e}")
+            return False
 
     async def scrape_all_products(self):
         """Main scraping workflow"""
@@ -384,7 +446,10 @@ class ToroScraperPlaywright:
                 time.sleep(1)
 
             # Save results
-            self.save_results_to_csv()
+            output_path = self.save_results_to_csv()
+            
+            if output_path:
+                self.upload_via_ftp(output_path)
 
             logger.info("Scraping completed successfully")
             return True
@@ -394,7 +459,13 @@ class ToroScraperPlaywright:
             return False
 
 async def main():
-    scraper = ToroScraperPlaywright("config.txt")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="config.txt", help="Path to config JSON file")
+    args = parser.parse_args()
+    
+    cfg_path = args.config if os.path.isabs(args.config) else os.path.join(BASE_DIR, args.config)
+    
+    scraper = ToroScraperPlaywright(cfg_path)
     success = await scraper.scrape_all_products()
 
     if success:
