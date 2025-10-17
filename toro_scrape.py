@@ -18,9 +18,52 @@ import argparse
 BASE_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(BASE_DIR, "browsers")
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Set up logging based on config (loaded just-in-time below)
+def setup_logging_from_config(config_path):
+    # Load minimal to fetch log settings
+    try:
+        with open(config_path, "r") as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+
+    log_level_str = (cfg.get("log_level") or "INFO").upper()
+    log_level = getattr(logging, log_level_str, logging.INFO)
+
+    # Root logger
+    logger = logging.getLogger()
+    logger.setLevel(log_level)
+
+    # Remove any existing handlers (avoid duplicates when rerun)
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    # Console handler
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(log_level)
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+
+    # File handler if provided
+    log_file = cfg.get("log_file")
+    if log_file:
+        try:
+            # Ensure directory exists
+            log_dir = os.path.dirname(log_file)
+            if log_dir and not os.path.exists(log_dir):
+                os.makedirs(log_dir, exist_ok=True)
+
+            fh = logging.FileHandler(log_file, mode='w', encoding="utf-8")
+            fh.setLevel(log_level)
+            fh.setFormatter(formatter)
+            logger.addHandler(fh)
+            logger.info(f"Logging to file: {log_file}")
+        except Exception as e:
+            logger.warning(f"Failed to set file logging to {log_file}: {e}")
+
+    return logger
 
 class ToroScraperPlaywright:
     def __init__(self, config_file=None):
@@ -32,20 +75,121 @@ class ToroScraperPlaywright:
         self.bearer_token = None
         self.session = requests.Session()
         self.results = []
+    
+    def _request_with_backoff(self, method, url, **kwargs):
+        """Wrapper around requests with simple retry/backoff for 429/5xx."""
+        log = logging.getLogger(__name__)
+        max_attempts = 4
+        backoff = 1.0
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = self.session.request(method, url, **kwargs)
+                # Rate limit handling
+                if resp.status_code == 429:
+                    retry_after = resp.headers.get("Retry-After")  
+                    sleep_s = float(retry_after) if retry_after else backoff  
+                    log.warning(f"429 Rate limited. Attempt {attempt}/{max_attempts}. Sleeping {sleep_s:.1f}s")  
+                    time.sleep(sleep_s)  
+                    backoff = min(backoff * 2, 8.0)  
+                    continue  
+                # Retry on transient server errors  
+                if 500 <= resp.status_code < 600:  
+                    if attempt < max_attempts:  
+                        log.warning(f"Server error {resp.status_code}. Attempt {attempt}/{max_attempts}. "  
+                                       f"Retrying in {backoff:.1f}s")  
+                        time.sleep(backoff)  
+                        backoff = min(backoff * 2, 8.0)  
+                        continue  
+                resp.raise_for_status()  
+                return resp  
+            except requests.RequestException as e:  
+                if attempt < max_attempts:  
+                    log.warning(f"HTTP error on {url}: {e}. Attempt {attempt}/{max_attempts}. "  
+                                   f"Retrying in {backoff:.1f}s")  
+                    time.sleep(backoff)  
+                    backoff = min(backoff * 2, 8.0)  
+                    continue  
+                log.error(f"Failed after {max_attempts} attempts: {url} - {e}")  
+                raise
+    
+    def process_one_product_sync(self, product_number, index, total):
+        """Process one product synchronously (called in thread pool)."""
+        log = logging.getLogger(__name__)
+        try:
+            log.info(f"Processing product {index}/{total}: {product_number}")
+
+            product_id = self.get_product_id_from_catalog(product_number)
+            if not product_id:
+                return None
+
+            result = self.get_product_pricing(product_id, product_number)
+            if not result:
+                return None
+
+            product_details = self.get_product_details(product_id)
+
+            result.update({
+                "short_description": product_details.get("shortDescription", ""),
+                "erp_number": product_details.get("erpNumber", ""),
+                "erp_description": product_details.get("erpDescription", ""),
+                "large_image_url": product_details.get("largeImagePath", ""),
+                "shipping_length": product_details.get("shippingLength", ""),
+                "shipping_width": product_details.get("shippingWidth", ""),
+                "shipping_height": product_details.get("shippingHeight", ""),
+                "shipping_weight": product_details.get("shippingWeight", ""),
+                "unit_of_measure": product_details.get("unitOfMeasure", ""),
+                "unit_of_measure_description": product_details.get("unitOfMeasureDescription", ""),
+                "availability_message": product_details.get("availability", {}).get("message", ""),
+                "is_active": product_details.get("isActive", ""),
+                "is_discontinued": product_details.get("isDiscontinued", ""),
+                "can_back_order": product_details.get("canBackOrder", ""),
+                "track_inventory": product_details.get("trackInventory", ""),
+                "minimum_order_qty": product_details.get("minimumOrderQty", ""),
+                "multiple_sale_qty": product_details.get("multipleSaleQty", ""),
+                "sku": product_details.get("sku", ""),
+                "upc_code": product_details.get("upcCode", ""),
+                "model_number": product_details.get("modelNumber", ""),
+                "brand": product_details.get("brand", ""),
+                "product_line": product_details.get("productLine", ""),
+                "tax_code1": product_details.get("taxCode1", ""),
+                "tax_code2": product_details.get("taxCode2", ""),
+                "tax_category": product_details.get("taxCategory", ""),
+                "product_detail_url": product_details.get("productDetailUrl", ""),
+                "is_special_order": product_details.get("isSpecialOrder", ""),
+                "is_gift_card": product_details.get("isGiftCard", ""),
+                "is_subscription": product_details.get("isSubscription", ""),
+                "can_add_to_cart": product_details.get("canAddToCart", ""),
+                "can_add_to_wishlist": product_details.get("canAddToWishlist", ""),
+                "can_show_price": product_details.get("canShowPrice", ""),
+                "can_show_unit_of_measure": product_details.get("canShowUnitOfMeasure", ""),
+                "can_enter_quantity": product_details.get("canEnterQuantity", ""),
+                "requires_real_time_inventory": product_details.get("requiresRealTimeInventory", ""),
+                "availability_message_type": product_details.get("availability", {}).get("messageType", ""),
+                "meta_description": product_details.get("metaDescription", ""),
+                "meta_keywords": product_details.get("metaKeywords", ""),
+                "page_title": product_details.get("pageTitle", ""),
+            })
+
+            return result
+
+        except Exception as e:
+            log.error(f"Error processing product {product_number}: {e}")
+            return None
 
     def load_config(self, config_file):
         """Load configuration from JSON file"""
         try:
             with open(config_file, 'r') as f:
                 config = json.load(f)
-            logger.info(f"Configuration loaded from {config_file}")
+            logging.getLogger(__name__).info(f"Configuration loaded from {config_file}")
             return config
         except Exception as e:
-            logger.error(f"Error loading config: {e}")
+            logging.getLogger(__name__).error(f"Error loading config: {e}")
             raise
 
     async def authenticate_with_playwright(self):
         """Use Playwright to authenticate and extract bearer token"""
+        log = logging.getLogger(__name__)
         async with async_playwright() as p:
             # Launch browser
             browser = await p.chromium.launch(
@@ -55,7 +199,7 @@ class ToroScraperPlaywright:
             page = await context.new_page()
 
             try:
-                logger.info("Starting authentication process...")
+                log.info("Starting authentication process...")
 
                 # Navigate to login URL
                 await page.goto(self.config["login_url"])
@@ -91,7 +235,7 @@ class ToroScraperPlaywright:
 
                 if not bearer_token:
                     # Try to intercept network requests to get the token
-                    logger.info("Token not found in storage, intercepting network requests...")
+                    log.info("Token not found in storage, intercepting network requests...")
 
                     # Navigate to a product page to trigger API calls
                     await page.goto("https://shop.thetorocompany.com/Product_UrlRoot/41-6820")
@@ -114,7 +258,7 @@ class ToroScraperPlaywright:
 
                 if bearer_token:
                     self.bearer_token = bearer_token
-                    logger.info("Bearer token extracted successfully")
+                    log.info("Bearer token extracted successfully")
 
                     # Set up session headers
                     self.session.headers.update({
@@ -125,34 +269,34 @@ class ToroScraperPlaywright:
 
                     return True
                 else:
-                    logger.error("Failed to extract bearer token")
+                    log.error("Failed to extract bearer token")
                     return False
 
             except Exception as e:
-                logger.error(f"Authentication error: {e}")
+                log.error(f"Authentication error: {e}")
                 return False
             finally:
                 await browser.close()
 
     def get_product_id_from_catalog(self, product_number):
         """Get productId from catalog API"""
+        log = logging.getLogger(__name__)
         try:
             catalog_url = f"https://shop.thetorocompany.com/api/v1/catalogpages?path=%2FProduct_UrlRoot%2F{product_number}"
-            response = self.session.get(catalog_url)
-            response.raise_for_status()
+            response = self._request_with_backoff("GET", catalog_url)
 
             data = response.json()
             product_id = data.get('productId')
 
             if product_id:
-                logger.info(f"Found productId {product_id} for product {product_number}")
+                log.info(f"Found productId {product_id} for product {product_number}")
                 return product_id
             else:
-                logger.warning(f"No productId found for product {product_number}")
+                log.warning(f"No productId found for product {product_number}")
                 return None
 
         except Exception as e:
-            logger.error(f"Error getting productId for {product_number}: {e}")
+            log.error(f"Error getting productId for {product_number}: {e}")
             return None
     
     def get_product_details(self, product_id):
@@ -165,17 +309,17 @@ class ToroScraperPlaywright:
                 "&includeAttributes=IncludeOnProduct"
                 "&replaceProducts=false"
             )
-            response = self.session.get(url)
-            response.raise_for_status()
+            response = self._request_with_backoff("GET", url)
             data = response.json()
             product = data.get("product", {})
             return product
         except Exception as e:
-            logger.error(f"Error getting product details for {product_id}: {e}")
+            log.error(f"Error getting product details for {product_id}: {e}")
             return {}
 
     def get_product_pricing(self, product_id, product_number):
         """Get product pricing from realtime pricing API"""
+        log = logging.getLogger(__name__)
         try:
             pricing_url = "https://shop.thetorocompany.com/api/v1/realtimepricing"
             payload = {
@@ -188,8 +332,7 @@ class ToroScraperPlaywright:
                 ]
             }
 
-            response = self.session.post(pricing_url, json=payload)
-            response.raise_for_status()
+            response = self._request_with_backoff("POST", pricing_url, json=payload)
 
             data = response.json()
             pricing_results = data.get('realTimePricingResults', [])
@@ -233,18 +376,19 @@ class ToroScraperPlaywright:
                     **inventory_data
                 }
 
-                logger.info(f"Successfully scraped data for {product_number}")
+                log.info(f"Successfully scraped data for {product_number}")
                 return combined_result
             else:
-                logger.warning(f"No pricing results for {product_number}")
+                log.warning(f"No pricing results for {product_number}")
                 return None
 
         except Exception as e:
-            logger.error(f"Error getting pricing for {product_number}: {e}")
+            log.error(f"Error getting pricing for {product_number}: {e}")
             return None
 
     def load_input_csv(self):
         """Load product numbers from input CSV"""
+        log = logging.getLogger(__name__)
         try:
             df = pd.read_csv(self.config["input_file"])
             
@@ -275,8 +419,8 @@ class ToroScraperPlaywright:
             df_filtered = df[df['Product Number'].notna()]
             products = df_filtered['Product Number'].tolist()
             
-            logger.info(f"Loaded {len(products)} products from {self.config['input_file']}")
-            logger.info(f"Filtered from {len(df)} total rows to {len(products)} valid Toro SKUs")
+            log.info(f"Loaded {len(products)} products from {self.config['input_file']}")
+            log.info(f"Filtered from {len(df)} total rows to {len(products)} valid Toro SKUs")
 
             # Limit rows if specified and not "all"
             max_rows = self.config.get("max_rows", "all")
@@ -286,20 +430,21 @@ class ToroScraperPlaywright:
                 try:
                     max_rows_int = int(max_rows)
                     products = products[:max_rows_int]
-                    logger.info(f"Limited to {max_rows_int} products")
+                    log.info(f"Limited to {max_rows_int} products")
                 except Exception:
-                    logger.warning(f"Invalid max_rows value: {max_rows}, using all products.")
+                    log.warning(f"Invalid max_rows value: {max_rows}, using all products.")
 
             return products
         except Exception as e:
-            logger.error(f"Error loading input CSV: {e}")
+            log.error(f"Error loading input CSV: {e}")
             raise
 
     def save_results_to_csv(self):
         """Save results to output CSV"""
+        log = logging.getLogger(__name__)
         try:
             if not self.results:
-                logger.warning("No results to save")
+                log.warning("No results to save")
                 return
 
             df = pd.DataFrame(self.results)
@@ -312,12 +457,12 @@ class ToroScraperPlaywright:
                 output_file = f"{name}_{timestamp}{ext}"
 
             df.to_csv(output_file, index=False)
-            logger.info(f"Results saved to {output_file}")
-            logger.info(f"Total products scraped: {len(self.results)}")
+            log.info(f"Results saved to {output_file}")
+            log.info(f"Total products scraped: {len(self.results)}")
             return output_file
 
         except Exception as e:
-            logger.error(f"Error saving results: {e}")
+            log.error(f"Error saving results: {e}")
             return None
     
     def upload_via_ftp(self, local_path):
@@ -327,27 +472,28 @@ class ToroScraperPlaywright:
         pwd = (self.config.get("ftp_password") or "").strip()
         port = (self.config.get("ftp_port", 21))
         remote_dir = (self.config.get("ftp_directory") or "").strip()
+        log = logging.getLogger(__name__)
         
         if not host or not user or not pwd:
-            logger.info("FTP settings not provided; skipping FTP upload.")
+            log.info("FTP settings not provided; skipping FTP upload.")
             return False
         
         if not os.path.isfile(local_path):
-            logger.error(f"FTP upload skipped: file does not exist: {local_path}")
+            log.error(f"FTP upload skipped: file does not exist: {local_path}")
             return False
         
         try:
-            logger.info(f"Connecting to FTP {host}:{port} ...")
+            log.info(f"Connecting to FTP {host}:{port} ...")
             with FTP() as ftp:
                 ftp.connect(host, port, timeout=30)
                 ftp.login(user, pwd)
-                logger.info("FTP login successful.")
+                log.info("FTP login successful.")
                 
                 if remote_dir:
                     try:
                         ftp.cwd(remote_dir)
                     except error_perm:
-                        logger.info(f"FTP directory '{remote_dir}' not found; attempting to create it.")
+                        log.info(f"FTP directory '{remote_dir}' not found; attempting to create it.")
                         
                         for part in remote_dir.replace("\\", "/").split("/"):
                             if not part:
@@ -360,112 +506,79 @@ class ToroScraperPlaywright:
                 
                 filename = os.path.basename(local_path)
                 with open(local_path, "rb") as f:
-                    logger.info(f"Uploading {filename} ...")
+                    log.info(f"Uploading {filename} ...")
                     ftp.storbinary(f"STOR {filename}", f)
                 
-                logger.info("FTP upload completed successfully.")
+                log.info("FTP upload completed successfully.")
                 return True
         
         except Exception as e:
-            logger.error(f"FTP upload failed: {e}")
+            log.error(f"FTP upload failed: {e}")
             return False
 
     async def scrape_all_products(self):
-        """Main scraping workflow"""
+        """Main scraping workflow with bounded threading"""
+        log = logging.getLogger(__name__)
         try:
             # Authenticate
             if not await self.authenticate_with_playwright():
-                logger.error("Authentication failed")
+                log.error("Authentication failed")
                 return False
 
             # Load products
             products = self.load_input_csv()
+            total = len(products)
 
-            # Process each product
-            for i, product_number in enumerate(products, 1):
-                logger.info(f"Processing product {i}/{len(products)}: {product_number}")
+            # Concurrency (default 6; can be overridden via config or CLI)
+            concurrency = int(self.config.get("concurrency", 6))
+            log.info(f"Starting threaded scrape with concurrency={concurrency}")
 
-                # Get product ID
-                product_id = self.get_product_id_from_catalog(product_number)
-                if not product_id:
-                    continue
-                
-                # Get pricing data
-                result = self.get_product_pricing(product_id, product_number)
-                if not result:
-                    continue
-                
-                # Get product details and merge
-                product_details = self.get_product_details(product_id)
-                # Pick the fields you want to add to your result  
-                result.update({  
-                    "short_description": product_details.get("shortDescription", ""),  
-                    "erp_number": product_details.get("erpNumber", ""),  
-                    "erp_description": product_details.get("erpDescription", ""),  
-                    "large_image_url": product_details.get("largeImagePath", ""),  
-                    "shipping_length": product_details.get("shippingLength", ""),  
-                    "shipping_width": product_details.get("shippingWidth", ""),  
-                    "shipping_height": product_details.get("shippingHeight", ""),  
-                    "shipping_weight": product_details.get("shippingWeight", ""),  
-                    "unit_of_measure": product_details.get("unitOfMeasure", ""),  
-                    "unit_of_measure_description": product_details.get("unitOfMeasureDescription", ""),  
-                    "availability_message": product_details.get("availability", {}).get("message", ""),  
-                    "is_active": product_details.get("isActive", ""),  
-                    "is_discontinued": product_details.get("isDiscontinued", ""),  
-                    "can_back_order": product_details.get("canBackOrder", ""),  
-                    "track_inventory": product_details.get("trackInventory", ""),  
-                    "minimum_order_qty": product_details.get("minimumOrderQty", ""),  
-                    "multiple_sale_qty": product_details.get("multipleSaleQty", ""),  
-                    "sku": product_details.get("sku", ""),  
-                    "upc_code": product_details.get("upcCode", ""),  
-                    "model_number": product_details.get("modelNumber", ""),  
-                    "brand": product_details.get("brand", ""),  
-                    "product_line": product_details.get("productLine", ""),  
-                    "tax_code1": product_details.get("taxCode1", ""),  
-                    "tax_code2": product_details.get("taxCode2", ""),  
-                    "tax_category": product_details.get("taxCategory", ""),  
-                    "product_detail_url": product_details.get("productDetailUrl", ""),  
-                    "is_special_order": product_details.get("isSpecialOrder", ""),  
-                    "is_gift_card": product_details.get("isGiftCard", ""),  
-                    "is_subscription": product_details.get("isSubscription", ""),  
-                    "can_add_to_cart": product_details.get("canAddToCart", ""),  
-                    "can_add_to_wishlist": product_details.get("canAddToWishlist", ""),  
-                    "can_show_price": product_details.get("canShowPrice", ""),  
-                    "can_show_unit_of_measure": product_details.get("canShowUnitOfMeasure", ""),  
-                    "can_enter_quantity": product_details.get("canEnterQuantity", ""),  
-                    "requires_real_time_inventory": product_details.get("requiresRealTimeInventory", ""),  
-                    "availability_message_type": product_details.get("availability", {}).get("messageType", ""),  
-                    "meta_description": product_details.get("metaDescription", ""),  
-                    "meta_keywords": product_details.get("metaKeywords", ""),  
-                    "page_title": product_details.get("pageTitle", ""),  
-                })
-                
-                self.results.append(result)
+            from concurrent.futures import ThreadPoolExecutor, as_completed
 
-                # Add delay to avoid rate limiting
-                time.sleep(1)
+            # Submit work
+            results_local = []
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = {
+                    executor.submit(self.process_one_product_sync, pn, i + 1, total): pn
+                    for i, pn in enumerate(products)
+                }
+                for fut in as_completed(futures):
+                    try:
+                        res = fut.result()
+                        if res:
+                            results_local.append(res)
+                    except Exception as e:
+                        pn = futures[fut]
+                        log.error(f"Unhandled exception for product {pn}: {e}")
+
+            # Merge results into self.results
+            self.results.extend(results_local)
 
             # Save results
             output_path = self.save_results_to_csv()
-            
             if output_path:
                 self.upload_via_ftp(output_path)
 
-            logger.info("Scraping completed successfully")
+            log.info("Scraping completed successfully")
             return True
 
         except Exception as e:
-            logger.error(f"Error in scraping workflow: {e}")
+            log.error(f"Error in scraping workflow: {e}")
             return False
 
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.txt", help="Path to config JSON file")
+    parser.add_argument("--concurrency", type=int, default=None, help="Max concurrent product requests")
     args = parser.parse_args()
     
     cfg_path = args.config if os.path.isabs(args.config) else os.path.join(BASE_DIR, args.config)
+    setup_logging_from_config(cfg_path)
+    logger = logging.getLogger(__name__)
     
     scraper = ToroScraperPlaywright(cfg_path)
+    if args.concurrency is not None:
+        scraper.config["concurrency"] = args.concurrency
     success = await scraper.scrape_all_products()
 
     if success:
