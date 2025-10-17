@@ -14,6 +14,17 @@ import sys
 import os
 import logging
 import argparse
+import signal
+import threading
+
+stop_requested = False
+
+def signal_handler(sig, frame):
+    global stop_requested
+    print("\nInterrupt received, stopping gracefully...")
+    stop_requested = True
+
+signal.signal(signal.SIGINT, signal_handler)
 
 BASE_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(BASE_DIR, "browsers")
@@ -72,6 +83,11 @@ class ToroScraperPlaywright:
         elif not os.path.isabs(config_file):
             config_file = os.path.join(BASE_DIR, config_file)
         self.config = self.load_config(config_file)
+        self.save_interval = int(self.config.get("save_interval", 0)) # 0 means no incremental saving
+        self.partial_file = self.config.get("output_file", "toro_pricing_output.csv") + ".partial"
+        self.processed_count = 0
+        self.scraped_product_numbers = set()
+        self.lock = threading.Lock()
         self.bearer_token = None
         self.session = requests.Session()
         self.results = []
@@ -83,7 +99,7 @@ class ToroScraperPlaywright:
         backoff = 1.0
         for attempt in range(1, max_attempts + 1):
             try:
-                resp = self.session.request(method, url, **kwargs)
+                resp = self.session.request(method, url, timeout=10, **kwargs)
                 # Rate limit handling
                 if resp.status_code == 429:
                     retry_after = resp.headers.get("Retry-After")  
@@ -115,6 +131,20 @@ class ToroScraperPlaywright:
     def process_one_product_sync(self, product_number, index, total):
         """Process one product synchronously (called in thread pool)."""
         log = logging.getLogger(__name__)
+        global stop_requested
+        
+        if stop_requested:
+            log.info(f"Skipping product {product_number} due to interrupt request")
+            return None
+        
+        with self.lock:
+            key = str(product_number).strip()
+            if key in self.scraped_product_numbers:  
+                log.info(f"Skipping already-scraped product {product_number}")  
+                return None  
+            # Reserve the product_number so no other thread starts it  
+            self.scraped_product_numbers.add(key)
+        
         try:
             log.info(f"Processing product {index}/{total}: {product_number}")
 
@@ -169,12 +199,40 @@ class ToroScraperPlaywright:
                 "meta_keywords": product_details.get("metaKeywords", ""),
                 "page_title": product_details.get("pageTitle", ""),
             })
+            
+            with self.lock:
+                self.results.append(result)
+                self.processed_count += 1
+                if self.save_interval > 0 and self.processed_count % self.save_interval == 0:
+                    self.save_partial_results()
 
             return result
 
         except Exception as e:
             log.error(f"Error processing product {product_number}: {e}")
             return None
+    
+    def save_partial_results(self):  
+        try:  
+            # Stable dedupe by product_number  
+            if self.results:  
+                seen = set()  
+                deduped = []  
+                for r in self.results:  
+                    k = str(r.get("product_number", "")).strip()  
+                    if not k or k in seen:  
+                        continue  
+                    seen.add(k)  
+                    deduped.append(r)  
+                self.results = deduped  
+    
+            df = pd.DataFrame(self.results)  
+            df.to_csv(self.partial_file, index=False)  
+            logging.getLogger(__name__).info(  
+                f"Partial results saved to {self.partial_file} ({len(self.results)} records)"  
+            )  
+        except Exception as e:  
+            logging.getLogger(__name__).error(f"Failed to save partial results: {e}")
 
     def load_config(self, config_file):
         """Load configuration from JSON file"""
@@ -387,7 +445,7 @@ class ToroScraperPlaywright:
             return None
 
     def load_input_csv(self):
-        """Load product numbers from input CSV"""
+        """Load product numbers from input CSV, resume from partial if exists"""
         log = logging.getLogger(__name__)
         try:
             df = pd.read_csv(self.config["input_file"])
@@ -419,6 +477,29 @@ class ToroScraperPlaywright:
             df_filtered = df[df['Product Number'].notna()]
             products = df_filtered['Product Number'].tolist()
             
+            if self.save_interval > 0 and os.path.exists(self.partial_file):
+                try:
+                    df_partial = pd.read_csv(self.partial_file)
+                    processed_products = {str(x).strip() for x in df_partial.get('product_number', []).tolist()}  
+                    products = [str(p).strip() for p in products]  
+                    products = [p for p in products if p and p not in processed_products]
+                    self.results = df_partial.to_dict(orient='records')
+                    self.processed_count = len(self.results)
+                    self.scraped_product_numbers = set(processed_products)
+                    log.info(f"Resuming from partial file with {self.processed_count} records")
+                except Exception as e:
+                    log.warning(f"Failed to load partial file: {e}")
+            
+            output_file = self.config.get("output_file")  
+            if output_file and os.path.exists(output_file):  
+                try:  
+                    df_output = pd.read_csv(output_file)  
+                    scraped_products = {str(x).strip() for x in df_output.get('product_number', []).tolist()}  
+                    products = [p for p in products if p not in scraped_products]  
+                    log.info(f"Excluded {len(scraped_products)} products already in output file")  
+                except Exception as e:  
+                    log.warning(f"Failed to load output file for duplicate check: {e}")
+            
             log.info(f"Loaded {len(products)} products from {self.config['input_file']}")
             log.info(f"Filtered from {len(df)} total rows to {len(products)} valid Toro SKUs")
 
@@ -434,35 +515,55 @@ class ToroScraperPlaywright:
                 except Exception:
                     log.warning(f"Invalid max_rows value: {max_rows}, using all products.")
 
+            products = [str(p).strip() for p in products if isinstance(p, str) and p.strip()]
+            products = list(dict.fromkeys(products))
             return products
+        
         except Exception as e:
             log.error(f"Error loading input CSV: {e}")
             raise
 
-    def save_results_to_csv(self):
-        """Save results to output CSV"""
-        log = logging.getLogger(__name__)
-        try:
-            if not self.results:
-                log.warning("No results to save")
-                return
-
-            df = pd.DataFrame(self.results)
-
-            # Check if output file exists and overwrite setting
-            output_file = self.config["output_file"]
-            if os.path.exists(output_file) and not self.config.get("overwrite_existing", True):
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                name, ext = os.path.splitext(output_file)
-                output_file = f"{name}_{timestamp}{ext}"
-
-            df.to_csv(output_file, index=False)
-            log.info(f"Results saved to {output_file}")
-            log.info(f"Total products scraped: {len(self.results)}")
-            return output_file
-
-        except Exception as e:
-            log.error(f"Error saving results: {e}")
+    def save_results_to_csv(self):  
+        """Save results to output CSV"""  
+        log = logging.getLogger(__name__)  
+        try:  
+            if not self.results:  
+                log.warning("No results to save")  
+                return  
+    
+            # Stable dedupe by product_number BEFORE final save  
+            seen = set()  
+            deduped = []  
+            for r in self.results:  
+                k = str(r.get("product_number", "")).strip()  
+                if not k or k in seen:  
+                    continue  
+                seen.add(k)  
+                deduped.append(r)  
+            self.results = deduped  
+    
+            df = pd.DataFrame(self.results)  
+    
+            # Check if output file exists and overwrite setting  
+            output_file = self.config["output_file"]  
+            if os.path.exists(output_file) and not self.config.get("overwrite_existing", True):  
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")  
+                name, ext = os.path.splitext(output_file)  
+                output_file = f"{name}_{timestamp}{ext}"  
+    
+            df.to_csv(output_file, index=False)  
+            log.info(f"Results saved to {output_file}")  
+            log.info(f"Total products scraped: {len(self.results)}")  
+    
+            # Remove partial file on successful full save  
+            if self.save_interval > 0 and os.path.exists(self.partial_file):  
+                os.remove(self.partial_file)  
+                logging.getLogger(__name__).info(f"Deleted partial file {self.partial_file}")  
+    
+            return output_file  
+    
+        except Exception as e:  
+            log.error(f"Error saving results: {e}")  
             return None
     
     def upload_via_ftp(self, local_path):
@@ -519,6 +620,7 @@ class ToroScraperPlaywright:
     async def scrape_all_products(self):
         """Main scraping workflow with bounded threading"""
         log = logging.getLogger(__name__)
+        global stop_requested
         try:
             # Authenticate
             if not await self.authenticate_with_playwright():
@@ -538,10 +640,13 @@ class ToroScraperPlaywright:
             # Submit work
             results_local = []
             with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = {
-                    executor.submit(self.process_one_product_sync, pn, i + 1, total): pn
-                    for i, pn in enumerate(products)
-                }
+                futures = {}
+                for i, pn in enumerate(products):
+                    if stop_requested:
+                        log.info("Interrupt detected, stopping submission of new products")
+                        break
+                    futures[executor.submit(self.process_one_product_sync, pn, i + 1, total)] = pn
+                    
                 for fut in as_completed(futures):
                     try:
                         res = fut.result()
@@ -553,8 +658,14 @@ class ToroScraperPlaywright:
 
             # Merge results into self.results
             self.results.extend(results_local)
+            
+            if stop_requested:  
+                # Save partial results only, do not finalize  
+                self.save_partial_results()  
+                log.info("Scraping interrupted by user. Partial results saved.")  
+                return False
 
-            # Save results
+            # Normal completion: save full results and delete partial file
             output_path = self.save_results_to_csv()
             if output_path:
                 self.upload_via_ftp(output_path)
@@ -587,4 +698,8 @@ async def main():
         print("❌ Scraping failed!")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nScript interrupted by user. Exiting...")
+        sys.exit(0)

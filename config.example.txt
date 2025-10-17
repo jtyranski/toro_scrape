@@ -4,6 +4,8 @@
     "password": "", 
     "headless_mode": true, 
     "max_rows": "All",
+    "save_interval": 10,
+    "concurrency": 6,
     "input_file": "allproductssamplefile.csv",
     "output_file": "output.csv",
     "rsv_qty": 5,
@@ -13,4 +15,6 @@
     "ftp_password": "",
     "ftp_directory": "",
     "overwrite_existing": true
+    "log_file": ".\\log\\toro_scrape.log",
+    "log_level": "INFO"
 }
