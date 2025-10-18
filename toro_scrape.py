@@ -1,6 +1,6 @@
 # toro_scrape.py
-# Version: 0.2.0
-# Last Updated: 2025-10-13
+# Version: 0.3.0
+# Last Updated: 2025-10-18
 
 import requests
 import json
