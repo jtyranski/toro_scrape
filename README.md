@@ -1,25 +1,25 @@
 # Toro Scrape
 
-Version 0.3.0
+Version 0.3.1
 
-`toro_scrape.py` automates logging into [Toro Identity/Shop](https://identity.toro.com/as/authorization.oauth2?response_type=code&client_id=InsiteCommerceClient&redirect_uri=https%3A%2F%2Fshop.thetorocompany.com%2Fidentity%2Fexternalcallbackextension&scope=openid%20profile%20email%20address), extracts product details and pricing via authenticated API calls, and saves results to CSV. The script can optionally upload the resulting CSV to an FTP server. It now supports robust retries, configurable logging, graceful interruption with partial saves, and concurrent scraping for speed.
+`toro_scrape.py` automates logging into [Toro Identity/Shop](https://identity.toro.com/as/authorization.oauth2?response_type=code&client_id=InsiteCommerceClient&redirect_uri=https%3A%2F%2Fshop.thetorocompany.com%2Fidentity%2Fexternalcallbackextension&scope=openid%20profile%20email%20address), extracts product details and pricing via authenticated API calls, and saves results to CSV. It supports robust retries, automatic re-authentication, configurable logging, graceful interruption with partial saves/resume, and concurrent scraping for speed. An optional FTP upload can publish the final CSV.
 
-## What's new in 0.3.0
-- Graceful Ctrl+C handling with partial save and resume on next run.
-- Config-driven logging level and optional log file.
-- Centralized HTTP retry/backoff for 429/5xx and transient network errors.
-- Incremental partial saving at a configured interval and automatic resuming.
-- Threaded scraping with configurable concurrency.
-- De-duplication of results by product_number.
+## What's new in 0.3.1
+- Early skip of already-processed product numbers to prevent re-scraping and duplicate requests.  
+- Automatic re-authentication on 401/403 with a single-flight lock to avoid token races.  
+- Hardened HTTP backoff: honors `Retry-After` for 429, retries 5xx, and improves error logging.  
+- Small randomized delays between requests to reduce rate-limit triggers.  
+- Stable deduplication before both partial and final saves.  
+- Safer partial resume flow: merges `.partial` and existing output to avoid rework.
 
-## Features
-- Automates login using Playwright.
-- Scrapes extensive product and pricing fields, including inventory and metadata.
-- Robust HTTP calls with retry/backoff.
-- Concurrent scraping with bounded thread pool.
-- Incremental partial save, resume, and deduplication.
-- Optional FTP upload of the final CSV.
-- Headless mode support.
+## Features  
+- Automates login with Playwright and extracts a Bearer token for API calls.  
+- Scrapes detailed product/pricing/inventory fields and metadata.  
+- Robust HTTP with retry/backoff for transient errors.  
+- Concurrent scraping with a bounded thread pool (configurable).  
+- Periodic partial saves with automatic resume.  
+- Final output deduplicated and optionally uploaded to FTP.  
+- Headless mode supported.
 
 ## Requirements
 
@@ -43,7 +43,7 @@ Included libraries:
 - `requests`: HTTP requests
 
 ### Running the packaged EXE (no Python required)
-Zip includes:
+Package typically includes:
 - ToroScraper.exe
 - browses/(Playwright browsers; e.g., chromium_headless_shell-XXXX/...)
 - config.txt
@@ -75,35 +75,45 @@ Example config (JSON):
 ```
 
 ### Parameters:
-- `login_url`: The login URL for Toro Identity.
-- `username`, `password`: Credentials for login.
-- `headless_mode`: true for headless browser, false to show browser window.
-- `max_rows`: "all" for all rows or an integer to limit the number processed.
-- `input_file`: CSV containing products to scrape.
-- `output_file`: Final CSV output filename.
-- `overwrite_existing`: If false and output_file exists, a timestamp is appended on save.
-- `rsv_qty`: Quantity used when requesting pricing.
-- FTP settings (optional):
-    - ftp_host, ftp_port, ftp_username, ftp_password, ftp_directory
-    - Leave ftp_host empty to skip FTP upload.
+- Authentication
+    - login_url: The login URL for Toro Identity.
+    - username, password: Credentials for login.
+    - headless_mode: true for headless browser, false to show browser window.
+- Workload
+    - max_rows: "all" for all rows or an integer to limit the number processed.
+    - input_file: CSV containing products to scrape.
+    - rsv_qty: Quantity used when requesting pricing.
+- Output
+- output_file: Final CSV output filename.
+- overwrite_existing: If false and output_file exists, a timestamp is appended on save.
+- save_interval: 0 disables periodic saves; N > 0 saves every N processed products to output_file.partial (used for resuming).
+- Concurrency
+    - concurrency: Number of worker threads for parallel product processing.
 - Logging:
     - log_level: DEBUG, INFO, WARNING, ERROR, CRITICAL (default INFO).
     - log_file: Optional path to write logs to a file in addition to console.
-- Partial save and concurrency:
-    - save_interval: 0 disables periodic saves; N > 0 saves every N processed products to output_file.partial (used for resuming).
-    - concurrency: Number of worker threads for parallel product processing.
+- FTP (optional):
+    - ftp_host, ftp_port, ftp_username, ftp_password, ftp_directory
+    - Leave ftp_host empty to skip FTP upload.
 
 ## Running the Script
 ### From source
 - To run the script, execute the following command in the terminal:
 ```bash
 python -m venv .venv
-. .venv/Scripts/activate    # Windows: .venv\Scripts\activate
+# Windows
+.venv\Scripts\activate
+# Linux/macOS
+#source ./venv/bin/activate
+
 pip install -r requirements.txt
 python -m playwright install chromium
 # Linux only:
 # python -m playwright install-deps
+
 python toro_scrape.py --config config.txt
+# optional override concurrency at runtime:
+# python toro_scrape.py --config.txt --concurrency 4
 ```
 
 ### From EXE
@@ -113,9 +123,9 @@ python toro_scrape.py --config config.txt
     - ToroScraper.exe --config "C:\path\config.txt"
 
 Ensure:
-- config.txt is correctly set up and located alongside the EXE unless you pass an absolute path.
+- config.txt is correct and accessible (same folder as EXE unless an absolute path is provided).
+- browsers/ folder (Playwright) exists and is not renamed.
 - Input CSV exists.
-- If Playwright complains about missing executable, ensure the browsers/ folder exists, is not renamed, and uses the expected Playwright structure.
 
 ## Input CSV
 By default, the project uses SolidCommerceProducts.csv format with fields like:
@@ -133,50 +143,54 @@ CSV columns include:
 
 Notes:
     - Some fields may be empty depending on API responses.
-    - Results are deduplicated by product_number before saving.
+    - Results are deduplicated by product_number before both partial and final saves.
 
 ## Partial Save and Resume
-- If save_interval > 0, the script periodically writes a partial CSV at output_file.partial and logs a message indicating how many records have been saved.
-- On the next run, if a partial file exists, the script:
+- If save_interval > 0, the script writes a partial CSV at output_file.partial every N records and logs progress.
     - Loads it to continue where it left off.
     - Skips product_numbers already present in the partial file.
-- If an output_file already exists, the script also attempts to skip product_numbers previously completed to avoid duplicates.
-- On normal completion, the final CSV is saved to output_file and the .partial file is deleted.
+- On next run (with the same config), the script:
+    - Loads .partial to continue where it left off.
+    - Skips product_numbers found in .partial and previously completed output file (if present).
+- On normal completion, final CSV is written and .partial is removed.
 
 ## Concurrency
-- The script uses a ThreadPoolExecutor to process multiple product_numbers concurrently.
-- Configure via config.concurrency or override using --concurrency CLI flag.
-- The script ensures thread-safe accumulation and skips already-scraped product_numbers.
+- Uses a ThreadPoolExecutor to process multiple product numbers concurrently.
+- Configure via config.concurrency, or override with --concurrency.
+- Thread-safe accumulation and early skip of already-scraped product_numbers prevent duplicates.
 
 ## Graceful Interruption
 - Press Ctrl+C to stop gracefully.
 - The script will:
-    - Avoid starting new tasks.
-    - Save partial results if save_interval > 0.
-    - Exit with a message indicating interruption.
+    - Stops submitting new tasks.
+    - Saves partial results if save_interval > 0.
+    - Exits with an interruption message.
 
 ## Logging
-- Logging level and optional file are configured via log_level and log_file.
-- Examples:
-    - log_level: "DEBUG" for detailed troubleshooting.
-    - log_file: "logs/toro_scrape.log" to write logs to disk (directory auto-created if needed).
+- Configurable via log_level and log_file.
+- Console and optional file logging (directory auto-created).
+- Clear messages for retries, rate limits, and re-authentication events.
 
 ## FTP Upload
-- If ftp_host, ftp_username, and ftp_password are provided, the script uploads the final CSV to the specified FTP directory.
-- If overwrite_existing is false and output_file exists, a timestamp is appended to the filename prior to saving/uploading.
-- FTP directory trees are created on the server if they don’t exist.
+- If ftp_host, ftp_username, and ftp_password are provided, uploads the final CSV to the configured directory.
+- If overwrite_existing is false and output_file exists, a timestamped filename is used before upload.
+- Missing directories on the server are created when possible.
 
 ## Troubleshooting
-- Login or Playwright errors:
-    - Ensure browsers/ exists and hasn’t been renamed.
-    - Set headless_mode to false to watch the login flow.
-- Rate limiting or server errors:
-    - The script automatically retries with exponential backoff for 429 and 5xx responses.
-- Partial resume issues:
-    - Delete the .partial file if you want a clean run.
+- Login/Playwright:
+    - Ensure browsers/ exists and matches Playwright’s expected structure.
+    - Set headless_mode: false to observe the login flow.
+- Rate limits/Server errors:
+    - Script automatically retries 429 (honors Retry-After) and 5xx with exponential backoff.
+    - Consider lowering concurrency and keeping it steady for long runs.
+- Re-authentication:
+    - 401/403 responses trigger a single automatic re-auth attempt.
+    - If you routinely see 403 but with “Customer Product Restriction,” those SKUs are intentionally inaccessible.
+- Partial resume:
+    - Delete output_file.partial if you want a clean restart.
     - Ensure save_interval is a positive integer to enable partial saves.
-- Duplicate rows:
-    - The script deduplicates by product_number before both partial and final save.
+- Duplicates:
+    - The script deduplicates by product_number prior to saving partial/final CSVs.
 
 ## License
 This script is provided as-is. Use at your own risk.
@@ -191,10 +205,5 @@ Please ensure to provide detailed information about the issue you're experiencin
 ## Changelog
 - 0.1.0 - Initial Release
 - 0.2.0 - Added FTP function; Playwright browser location notes
-- 0.3.0
-    - Added graceful Ctrl+C handling and partial save on interrupt
-    - Introduced config-based logging (log_level, log_file)
-    - Implemented centralized HTTP retries/backoff
-    - Added save_interval partial saves and automatic resume
-    - Introduced configurable concurrency with threading and CLI override
-    - Improved deduplication and robustness during final save
+- 0.3.0 - Graceful Ctrl+C, config logging, centralized backoff, partial saves, concurrency, dedupe on save.
+- 0.3.1 — Early duplicate skip, automatic re-auth on 401/403, improved backoff with 429 handling, jittered delays, safer resume and dedupe.
